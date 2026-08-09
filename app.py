@@ -11,7 +11,6 @@ from streamlit_autorefresh import st_autorefresh
 
 import db
 import auth
-import theme
 from utils import format_schedule_display
 
 st.set_page_config(page_title="국장님 보고 - 실시간 현황", page_icon="📢", layout="wide")
@@ -19,14 +18,9 @@ st.set_page_config(page_title="국장님 보고 - 실시간 현황", page_icon="
 db.init_db()
 auth.require_login()
 auth.sidebar_user_info()
-theme.inject_custom_css()
 
-header_col1, header_col2 = st.columns([1, 6])
-with header_col1:
-    theme.show_mata("standard", width=90)
-with header_col2:
-    st.title("📢 국장님 보고 실시간 현황")
-    st.caption("시작 전 · 진행 중 상태인 보고만 예정 시각 순서로 보여줍니다. 전체 이력이나 등록/수정은 왼쪽 '보고 진행현황' 페이지를 이용해주세요.")
+st.title("📢 국장님 보고 실시간 현황")
+st.caption("시작 전 · 진행 중 상태인 보고만 예정 시각 순서로 보여줍니다. 전체 이력이나 등록/수정은 왼쪽 '보고 진행현황' 페이지를 이용해주세요.")
 
 with st.sidebar:
     st.divider()
@@ -46,28 +40,17 @@ active_reports = [
 ]
 
 if not active_reports:
-    empty_col1, empty_col2 = st.columns([1, 4])
-    with empty_col1:
-        theme.show_mata("thinking", width=100)
-    with empty_col2:
-        st.info("현재 대기 중이거나 진행 중인 보고가 없습니다.")
+    st.info("현재 대기 중이거나 진행 중인 보고가 없습니다.")
 else:
     col_status_order = {"진행 중": 0, "시작 전": 1}
     active_reports.sort(key=lambda r: (col_status_order.get(r["status"], 2), r["scheduled_date"] or "9999"))
 
     for r in active_reports:
         badge = "🟢 진행 중" if r["status"] == "진행 중" else "⚪ 시작 전"
-        cols = st.columns([3, 2, 2])
-        with cols[0]:
-            st.markdown(f"### {r['team_name'] or '(이름 미입력)'}")
-        with cols[1]:
-            st.markdown(f"**{badge}**")
-        with cols[2]:
-            st.markdown(format_schedule_display(r["scheduled_date"], r["scheduled_time"]))
-        st.divider()
+        with st.container(border=True):
+            st.markdown(
+                f"#### {r['team_name'] or '(이름 미입력)'}\n"
+                f"{badge} · {format_schedule_display(r['scheduled_date'], r['scheduled_time'])}"
+            )
 
-footer_col1, footer_col2 = st.columns([1, 6])
-with footer_col1:
-    theme.show_mata("back", width=50)
-with footer_col2:
-    st.caption(f"마지막 갱신: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"마지막 갱신: {time.strftime('%Y-%m-%d %H:%M:%S')}")

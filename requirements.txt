@@ -2,3 +2,4 @@ streamlit>=1.35
 extra-streamlit-components>=0.1.60
 streamlit-autorefresh>=1.0.1
 streamlit-calendar>=1.2.0
+libsql-client>=0.3.0

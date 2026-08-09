@@ -17,6 +17,37 @@ DB 파일은 기본적으로 이 파일과 같은 폴더의 report_dashboard.db 
   일찍 완료 처리) 바꿔둔 경우는 뒤로 되돌리지 않습니다.
 """
 
+"""
+db.py
+SQLite / Turso 데이터베이스 연결 및 스키마/CRUD 헬퍼 모음.
+
+저장소는 두 가지 모드로 동작합니다:
+- 로컬 모드 (기본값): 이 파일과 같은 폴더의 report_dashboard.db 파일 하나를 사용.
+  스트림릿 클라우드 시크릿(TURSO_DATABASE_URL / TURSO_AUTH_TOKEN)이 설정되어 있지 않으면
+  자동으로 이 모드로 동작합니다. 지금까지 PC에서 테스트하던 방식 그대로입니다.
+- Turso 모드: 위 두 시크릿이 설정되어 있으면 자동으로 전환됩니다. 스트림릿 커뮤니티
+  클라우드처럼 파일 시스템이 재배포/재시작 때마다 초기화되는 환경에서도 데이터가
+  영구적으로 보존됩니다. 아래 쪽의 _TursoConn / _TursoCursor 는 이 파일 나머지 부분
+  (쿼리 로직 500줄 이상)이 하나도 안 바뀌어도 되도록, sqlite3 커넥션과 거의 동일한
+  인터페이스(.execute, .commit, with-문)로 감싸는 얇은 어댑터입니다.
+  ⚠️ 이 Turso 연동 부분은 (네트워크가 막힌 개발 환경 특성상) 실제 Turso 서버에 붙여서
+  검증하지 못했습니다. 실제 배포 후 안 되는 부분이 있으면 알려주세요.
+
+동시 접속 관련 설계:
+- WAL 모드 사용(로컬 모드에서만 해당): 한 사람이 쓰는 동안 다른 사람이 읽는 것까지
+  막히지 않도록 함.
+- busy_timeout 설정: 아주 짧은 순간 여러 명이 동시에 쓰려고 하면, 에러를 즉시 던지지 않고
+  최대 5초까지 기다렸다가 처리함.
+- register_report / edit_report 는 "겹치는 시간 확인 + 실제 저장"을 하나의 트랜잭션(BEGIN IMMEDIATE
+  / Turso 트랜잭션)으로 묶어서, 두 사람이 동시에 같은 시간대를 등록해도 한 명만 성공하도록 함.
+
+상태 자동 전환 설계:
+- 보고 등록 시에는 항상 '시작 전' 으로 시작합니다 (사람이 직접 상태를 고르지 않음).
+- auto_update_statuses() 를 화면을 열 때마다 호출해서, 예정 시각이 지나면 자동으로
+  '진행 중' -> (20분 경과) '완료' 로 전진시킵니다. 시각을 사람이 직접 수정하면(edit_report)
+  그 즉시 새 시각 기준으로 양방향(앞으로/뒤로) 재계산됩니다.
+"""
+
 import sqlite3
 import hashlib
 import os
@@ -51,8 +82,101 @@ def _now():
     return datetime.now().isoformat(timespec="seconds")
 
 
+# ========== 저장소 모드 판단 (로컬 SQLite vs Turso) ==========
+
+def _get_secret(name):
+    """환경변수 먼저 보고, 없으면 스트림릿 시크릿(st.secrets)에서 찾음. 둘 다 없으면 None."""
+    val = os.environ.get(name)
+    if val:
+        return val
+    try:
+        import streamlit as st
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
+TURSO_DATABASE_URL = _get_secret("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = _get_secret("TURSO_AUTH_TOKEN")
+USE_TURSO = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN)
+
+_turso_client = None
+
+
+def _get_turso_client():
+    global _turso_client
+    if _turso_client is None:
+        import libsql_client
+        _turso_client = libsql_client.create_client_sync(
+            url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN
+        )
+    return _turso_client
+
+
+class _TursoCursor:
+    """libsql_client 의 실행 결과를 sqlite3 커서처럼(.fetchone/.fetchall) 흉내내는 래퍼.
+    fetchall()이 이미 일반 dict를 반환하므로, 기존 코드의 dict(row) 호출은 dict(dict)로
+    그냥 복사만 되어 문제없이 동작합니다."""
+
+    def __init__(self, result_set):
+        columns = list(getattr(result_set, "columns", []) or [])
+        self._rows = [dict(zip(columns, row)) for row in result_set.rows]
+        self._idx = 0
+        self.lastrowid = (
+            getattr(result_set, "last_insert_rowid", None)
+            or getattr(result_set, "last_insert_row_id", None)
+        )
+
+    def fetchone(self):
+        if self._idx < len(self._rows):
+            row = self._rows[self._idx]
+            self._idx += 1
+            return row
+        return None
+
+    def fetchall(self):
+        rows = self._rows[self._idx:]
+        self._idx = len(self._rows)
+        return rows
+
+
+class _TursoConn:
+    """db.py 나머지 코드가 기대하는 최소 인터페이스(.execute/.commit/.rollback/.close)로
+    libsql_client 를 감싸는 어댑터. tx가 주어지면 그 트랜잭션 범위 안에서 실행."""
+
+    def __init__(self, client, tx=None):
+        self._client = client
+        self._tx = tx
+
+    def execute(self, sql, params=None):
+        target = self._tx if self._tx is not None else self._client
+        rs = target.execute(sql, params or [])
+        return _TursoCursor(rs)
+
+    def commit(self):
+        if self._tx is not None:
+            self._tx.commit()
+
+    def rollback(self):
+        if self._tx is not None:
+            self._tx.rollback()
+
+    def close(self):
+        pass  # 클라이언트는 프로세스 전체에서 재사용, 개별 연결 단위로 닫지 않음
+
+
 @contextmanager
 def get_conn():
+    if USE_TURSO:
+        client = _get_turso_client()
+        conn = _TursoConn(client)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+        return
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -71,6 +195,18 @@ def get_conn_immediate():
     쓰기 작업 하나를 '한 명씩 순서대로'만 처리하도록 즉시 쓰기 락을 거는 트랜잭션.
     같은 시간대 중복 등록 같은 동시 접속 문제를 막기 위해 사용.
     """
+    if USE_TURSO:
+        client = _get_turso_client()
+        tx = client.transaction()
+        conn = _TursoConn(client, tx=tx)
+        try:
+            yield conn
+            tx.commit()
+        except Exception:
+            tx.rollback()
+            raise
+        return
+
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
