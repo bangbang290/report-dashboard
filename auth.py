@@ -156,7 +156,16 @@ def require_login():
     if st.session_state["user"] is not None:
         return st.session_state["user"]
 
-    st.title("국장님 보고 진행현황")
+    import theme
+    theme.inject_custom_css()
+
+    header_col1, header_col2 = st.columns([1, 3])
+    with header_col1:
+        theme.show_mata("official", width=140)
+    with header_col2:
+        st.title("국장님 보고 진행현황")
+        st.caption("관세청 심사총괄2과 · 마타와 함께하는 보고 관리")
+
     tab1, tab2 = st.tabs(["로그인", "최초 등록"])
     with tab1:
         _login_form()
@@ -178,8 +187,15 @@ def sidebar_user_info():
     user = current_user()
     if not user:
         return
+    import theme
+    theme.inject_custom_css()
     with st.sidebar:
-        st.markdown(f"**{user['username']}**님 ({'관리자' if user['role'] == db.ROLE_ADMIN else '일반 사용자'})")
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            theme.show_mata("standard", width=60)
+        with c2:
+            st.markdown(f"**{user['username']}**님")
+            st.caption('관리자' if user['role'] == db.ROLE_ADMIN else '일반 사용자')
         if user.get("department"):
             st.caption(user["department"])
         if st.button("로그아웃", use_container_width=True):

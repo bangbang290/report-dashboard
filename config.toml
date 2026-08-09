@@ -1,0 +1,9 @@
+# 관세청 내부 인터페이스 + 마타 캐릭터 톤에 맞춘 색상 테마
+# (screenshot의 아이보리 배경 + 마타 정장 남색/넥타이 파란색에서 실제 추출한 색상)
+
+[theme]
+primaryColor = "#005da7"            # 마타 넥타이 색 - 버튼/강조 요소
+backgroundColor = "#fffdf8"         # 은은한 아이보리 배경
+secondaryBackgroundColor = "#feecd2" # 마타 캐릭터 크림톤 - 사이드바/카드 배경
+textColor = "#221815"               # 마타 외곽선 색 - 진한 먹색 텍스트
+font = "sans serif"
