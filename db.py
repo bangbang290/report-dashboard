@@ -53,11 +53,22 @@ import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 
 from utils import find_conflicts, suggest_next_available_time, compose_team_name
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report_dashboard.db")
+
+# 서버가 어느 시간대에서 돌든(스트림릿 클라우드는 보통 UTC) 상관없이,
+# "지금 몇 시인지"는 항상 한국 시간(KST) 기준으로 계산합니다.
+KST = ZoneInfo("Asia/Seoul")
+
+
+def _now_kst():
+    """현재 시각을 한국 시간 기준으로. (서버가 UTC든 어디든 상관없이 항상 KST 기준 시각을 반환)"""
+    return datetime.now(KST).replace(tzinfo=None)
+
 
 STATUS_OPTIONS = ["시작 전", "진행 중", "완료"]
 STATUS_ORDER = {"시작 전": 0, "진행 중": 1, "완료": 2}
@@ -79,7 +90,7 @@ DEPARTMENT_OPTIONS = [
 
 
 def _now():
-    return datetime.now().isoformat(timespec="seconds")
+    return _now_kst().isoformat(timespec="seconds")
 
 
 # ========== 저장소 모드 판단 (로컬 SQLite vs Turso) ==========
@@ -366,7 +377,7 @@ def _is_locked_out(conn, username: str):
     if not row or not row["locked_until"]:
         return False, None
     locked_until = datetime.fromisoformat(row["locked_until"])
-    if datetime.now() < locked_until:
+    if _now_kst() < locked_until:
         return True, locked_until
     return False, None
 
@@ -389,7 +400,7 @@ def verify_user(username: str, password: str):
             fail_count = (existing["fail_count"] if existing else 0) + 1
             locked_until = None
             if fail_count >= LOGIN_MAX_FAILS:
-                locked_until = (datetime.now() + timedelta(minutes=LOGIN_LOCK_MINUTES)).isoformat()
+                locked_until = (_now_kst() + timedelta(minutes=LOGIN_LOCK_MINUTES)).isoformat()
                 fail_count = 0
             if existing:
                 conn.execute(
@@ -497,7 +508,7 @@ def get_session_user(token: str):
         if not row:
             return None
         created_at = datetime.fromisoformat(row["created_at"])
-        if datetime.now() - created_at > timedelta(days=SESSION_MAX_AGE_DAYS):
+        if _now_kst() - created_at > timedelta(days=SESSION_MAX_AGE_DAYS):
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
             return None
         user_row = conn.execute("SELECT * FROM users WHERE username = ?", (row["username"],)).fetchone()
@@ -548,7 +559,7 @@ def get_times_for_date(date_str: str, exclude_id: int = None, conn=None):
 
 def _compute_status_for_schedule(scheduled_date, scheduled_time, now=None):
     """예정 날짜/시각을 기준으로 지금 이 순간의 '올바른' 상태를 계산."""
-    now = now or datetime.now()
+    now = now or _now_kst()
     if not scheduled_date or not scheduled_time:
         return "시작 전"
     try:
@@ -681,7 +692,7 @@ def auto_update_statuses():
     시각을 수정하는 경우의 상태 재계산은 edit_report 에서 즉시, 양방향으로 처리합니다.)
     화면을 열 때마다 호출하면 됩니다 (앱/보고 진행현황 페이지 상단에서 호출).
     """
-    now = datetime.now()
+    now = _now_kst()
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT id, status, scheduled_date, scheduled_time FROM reports WHERE status != '완료'"
