@@ -6,34 +6,26 @@ auth.py
 로그인은 이름 + 4자리 숫자 PIN 방식입니다. (짧아서 외우기 쉽지만, 그만큼 5회 연속
 틀리면 5분간 잠기는 보호장치가 더 중요합니다 - db.py 의 로그인 시도 제한 참고)
 
-로그인 유지(새로고침해도 로그인 안 풀리게) 방식:
-- 로그인 성공 시, 서버(DB)에 세션 토큰을 만들고 그 토큰을 브라우저 쿠키에 저장합니다.
-- 페이지를 새로고침하면 st.session_state 는 초기화되지만, 쿠키에 저장된 토큰은 남아있으므로
-  그 토큰으로 DB를 조회해서 자동으로 다시 로그인 상태를 복원합니다.
-- 쿠키는 extra-streamlit-components 라는 작은 라이브러리로 다룹니다. (requirements.txt 참고)
+로그인 유지(새로고침해도/다른 앱 갔다와도 로그인 안 풀리게) 방식:
+- 로그인 성공 시, 서버(DB)에 세션 토큰을 만들고 그 토큰을 주소창 URL 뒤에 살짝 붙여둡니다
+  (예: ?s=abcd1234...). 새로고침을 해도 브라우저는 이 URL을 그대로 다시 요청하기 때문에,
+  그 토큰으로 DB를 조회해서 자동으로 로그인 상태를 복원합니다.
+- (이전 버전은 브라우저 쿠키를 다루는 별도 컴포넌트를 썼는데, 그 컴포넌트가 브라우저에
+  로드되는 타이밍 문제로 새로고침 시 로그인이 자꾸 풀리는 경우가 있었습니다. 이번 방식은
+  스트림릿 자체 기능(st.query_params)만 쓰기 때문에 그런 로딩 지연 문제가 없습니다.)
 """
 
-from datetime import datetime, timedelta
-
 import streamlit as st
-import extra_streamlit_components as stx
 
 import db
 from utils import validate_pin
 
-COOKIE_NAME = "report_dashboard_session"
+SESSION_QUERY_KEY = "s"
 
 
 def _init_session():
     if "user" not in st.session_state:
         st.session_state["user"] = None
-
-
-def _get_cookie_manager():
-    # 같은 CookieManager 인스턴스를 세션 안에서 재사용 (매 rerun마다 새로 만들면 중복 컴포넌트 문제가 생길 수 있음)
-    if "_cookie_manager" not in st.session_state:
-        st.session_state["_cookie_manager"] = stx.CookieManager(key="report_dashboard_cookie_manager")
-    return st.session_state["_cookie_manager"]
 
 
 def current_user():
@@ -50,11 +42,8 @@ def logout():
     token = st.session_state.get("_session_token")
     if token:
         db.delete_session(token)
-    cookie_manager = _get_cookie_manager()
-    try:
-        cookie_manager.delete(COOKIE_NAME)
-    except KeyError:
-        pass  # 쿠키가 이미 없는 경우
+    if SESSION_QUERY_KEY in st.query_params:
+        del st.query_params[SESSION_QUERY_KEY]
     st.session_state["user"] = None
     st.session_state["_session_token"] = None
     st.rerun()
@@ -72,12 +61,7 @@ def _do_login(username: str, pin: str):
         return
 
     token = db.create_session(result["username"])
-    cookie_manager = _get_cookie_manager()
-    cookie_manager.set(
-        COOKIE_NAME, token,
-        expires_at=datetime.now() + timedelta(days=db.SESSION_MAX_AGE_DAYS),
-        key="set_session_cookie",
-    )
+    st.query_params[SESSION_QUERY_KEY] = token
     st.session_state["user"] = result
     st.session_state["_session_token"] = token
     st.rerun()
@@ -130,10 +114,9 @@ def _signup_form():
             st.error(msg)
 
 
-def _try_restore_session_from_cookie():
-    """쿠키에 로그인 토큰이 남아있으면 자동으로 로그인 상태를 복원."""
-    cookie_manager = _get_cookie_manager()
-    token = cookie_manager.get(COOKIE_NAME)
+def _try_restore_session_from_query():
+    """주소창 URL에 로그인 토큰(?s=...)이 남아있으면 자동으로 로그인 상태를 복원."""
+    token = st.query_params.get(SESSION_QUERY_KEY)
     if not token:
         return
     user = db.get_session_user(token)
@@ -144,14 +127,14 @@ def _try_restore_session_from_cookie():
 
 def require_login():
     """
-    로그인 안 되어 있으면 (쿠키로도 복원 안 되면) 로그인/가입 폼만 보여주고
+    로그인 안 되어 있으면 (URL 토큰으로도 복원 안 되면) 로그인/가입 폼만 보여주고
     st.stop() 으로 페이지 실행을 막음.
     """
     _init_session()
     db.init_db()
 
     if st.session_state["user"] is None:
-        _try_restore_session_from_cookie()
+        _try_restore_session_from_query()
 
     if st.session_state["user"] is not None:
         return st.session_state["user"]
