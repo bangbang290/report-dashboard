@@ -125,6 +125,17 @@ def _try_restore_session_from_query():
         st.session_state["_session_token"] = token
 
 
+def _ensure_query_has_token():
+    """
+    이미 로그인된 상태인데, 페이지 이동 등으로 주소창에서 ?s=토큰이 빠졌으면 다시 붙여줌.
+    (스트림릿이 여러 페이지 사이를 이동할 때 쿼리 파라미터를 안 옮겨주는 경우가 있어서,
+    화면을 그릴 때마다 계속 확인/복구합니다.)
+    """
+    token = st.session_state.get("_session_token")
+    if token and st.query_params.get(SESSION_QUERY_KEY) != token:
+        st.query_params[SESSION_QUERY_KEY] = token
+
+
 def require_login():
     """
     로그인 안 되어 있으면 (URL 토큰으로도 복원 안 되면) 로그인/가입 폼만 보여주고
@@ -137,6 +148,7 @@ def require_login():
         _try_restore_session_from_query()
 
     if st.session_state["user"] is not None:
+        _ensure_query_has_token()
         return st.session_state["user"]
 
     st.title("국장님 보고 진행현황")
