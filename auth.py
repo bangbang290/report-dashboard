@@ -12,11 +12,12 @@ auth.py
   안 사라집니다. (이전 버전에서 시도했던 "URL 뒤에 토큰 붙이기" 방식은 페이지 이동 시
   스트림릿이 새 페이지 주소를 처음부터 다시 만들면서 토큰이 빠지는 문제가 있어서 폐기했습니다.)
 - 쿠키는 브라우저에 "설치"되고 나서 읽어오기까지 아주 잠깐(한 rerun 정도) 시간이 걸립니다.
-  이걸 "쿠키가 없다 = 로그인 안 됨"으로 착각하면 오히려 로그인이 자�raud 풀리는 것처럼
+  이걸 "쿠키가 없다 = 로그인 안 됨"으로 착각하면 오히려 로그인이 자꾸 풀리는 것처럼
   보이는 문제가 생기므로, 쿠키가 "아직 로딩 중"인 상태와 "진짜로 없음"인 상태를 구분해서
   처리합니다 (_try_restore_session_from_cookie 참고).
 """
 
+import time
 from datetime import datetime, timedelta
 
 import streamlit as st
@@ -59,6 +60,7 @@ def logout():
         cookie_manager.delete(COOKIE_NAME)
     except KeyError:
         pass  # 쿠키가 이미 없는 경우
+    time.sleep(0.5)
     st.session_state["user"] = None
     st.session_state["_session_token"] = None
     st.rerun()
@@ -82,6 +84,10 @@ def _do_login(username: str, pin: str):
         expires_at=datetime.now() + timedelta(days=db.SESSION_MAX_AGE_DAYS),
         key="set_session_cookie",
     )
+    # 쿠키가 브라우저에 실제로 저장되는 데 아주 잠깐 시간이 걸리는데, 그걸 기다리지 않고
+    # 바로 rerun 해버리면 저장이 중간에 끊겨서 다음 새로고침 때 쿠키가 없는 것처럼 보이는
+    # 문제가 있었습니다. 그래서 짧게 대기했다가 넘어갑니다.
+    time.sleep(0.5)
     st.session_state["user"] = result
     st.session_state["_session_token"] = token
     st.rerun()
