@@ -6,39 +6,36 @@ auth.py
 로그인은 이름 + 4자리 숫자 PIN 방식입니다. (짧아서 외우기 쉽지만, 그만큼 5회 연속
 틀리면 5분간 잠기는 보호장치가 더 중요합니다 - db.py 의 로그인 시도 제한 참고)
 
-로그인 유지(새로고침해도/페이지 이동해도/다른 앱 갔다와도 로그인 안 풀리게) 방식:
-- 로그인 성공 시, 서버(DB)에 세션 토큰을 만들고 그 토큰을 브라우저 쿠키에 저장합니다.
-  쿠키는 URL(페이지 경로)이 바뀌어도 브라우저에 계속 붙어있기 때문에, 페이지를 이동해도
-  안 사라집니다. (이전 버전에서 시도했던 "URL 뒤에 토큰 붙이기" 방식은 페이지 이동 시
-  스트림릿이 새 페이지 주소를 처음부터 다시 만들면서 토큰이 빠지는 문제가 있어서 폐기했습니다.)
-- 쿠키는 브라우저에 "설치"되고 나서 읽어오기까지 아주 잠깐(한 rerun 정도) 시간이 걸립니다.
-  이걸 "쿠키가 없다 = 로그인 안 됨"으로 착각하면 오히려 로그인이 자꾸 풀리는 것처럼
-  보이는 문제가 생기므로, 쿠키가 "아직 로딩 중"인 상태와 "진짜로 없음"인 상태를 구분해서
-  처리합니다 (_try_restore_session_from_cookie 참고).
+로그인 유지(새로고침해도/페이지 이동해도/다른 앱 갔다와도 로그인 안 풀리게) 방식 (3번째 시도):
+- 로그인 성공 시, 서버(DB)에 세션 토큰을 만들고 (1) 주소창 URL 뒤(?s=...)에 붙이고
+  (2) 브라우저 쿠키에도 저장합니다.
+- 이번엔 별도 외부 라이브러리(extra-streamlit-components) 없이, 스트림릿 자체 기능인
+  st.components.v1.html() 로 순수 자바스크립트를 직접 심어서 쿠키를 다룹니다. 이전에
+  쓰던 라이브러리는 자체 컴포넌트를 다른 위치에서 불러오는 구조라 그 통신 과정에서
+  쿠키 저장이 자꾸 씹히는 문제가 있었던 것으로 보입니다. st.components.v1.html() 은
+  스트림릿 앱과 같은 위치에서 바로 실행되는 훨씬 단순한 방식이라 더 안정적입니다.
+- 흐름: 로그인 성공 → URL에 토큰 붙이고 + 쿠키에도 저장.
+  이후 페이지 이동 등으로 URL의 토큰이 빠지면(이건 스트림릿 자체 특성) → 로그인 폼을
+  보여주기 직전에, "쿠키에 토큰이 남아있으면 주소를 자동으로 그 토큰 붙은 걸로
+  바꿔서 새로고침"하는 자바스크립트를 실행 → 새로고침된 페이지는 URL에 토큰이 있으니
+  정상적으로 로그인 복원됨.
 """
 
 import time
-from datetime import datetime, timedelta
 
 import streamlit as st
-import extra_streamlit_components as stx
+import streamlit.components.v1 as components
 
 import db
 from utils import validate_pin
 
 COOKIE_NAME = "report_dashboard_session"
+SESSION_QUERY_KEY = "s"
 
 
 def _init_session():
     if "user" not in st.session_state:
         st.session_state["user"] = None
-
-
-def _get_cookie_manager():
-    # 같은 CookieManager 인스턴스를 세션 안에서 재사용 (매 rerun마다 새로 만들면 중복 컴포넌트 문제가 생길 수 있음)
-    if "_cookie_manager" not in st.session_state:
-        st.session_state["_cookie_manager"] = stx.CookieManager(key="report_dashboard_cookie_manager")
-    return st.session_state["_cookie_manager"]
 
 
 def current_user():
@@ -51,16 +48,66 @@ def is_admin() -> bool:
     return bool(user) and user.get("role") == db.ROLE_ADMIN
 
 
+def _set_browser_cookie(token: str):
+    """순수 자바스크립트로 브라우저 쿠키에 로그인 토큰을 저장."""
+    max_age_seconds = db.SESSION_MAX_AGE_DAYS * 24 * 60 * 60
+    components.html(
+        f"""
+        <script>
+        document.cookie = "{COOKIE_NAME}={token}; max-age={max_age_seconds}; path=/; SameSite=Lax";
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _clear_browser_cookie():
+    components.html(
+        f"""
+        <script>
+        document.cookie = "{COOKIE_NAME}=; max-age=0; path=/; SameSite=Lax";
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _sync_url_from_cookie():
+    """
+    (로그인 안 된 상태에서만 호출) 브라우저 쿠키에 로그인 토큰이 남아있는데 주소창에는
+    없으면, 자바스크립트로 주소를 그 토큰이 붙은 형태로 바꿔서 자동으로 새로고침합니다.
+    그러면 다음 페이지 로딩 때는 주소창의 토큰으로 정상 복원됩니다.
+    """
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            try {{
+                var topWin = window.top;
+                var params = new URLSearchParams(topWin.location.search);
+                if (!params.has('{SESSION_QUERY_KEY}')) {{
+                    var match = document.cookie.match(/(?:^|; ){COOKIE_NAME}=([^;]*)/);
+                    if (match && match[1]) {{
+                        params.set('{SESSION_QUERY_KEY}', match[1]);
+                        topWin.location.search = params.toString();
+                    }}
+                }}
+            }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def logout():
     token = st.session_state.get("_session_token")
     if token:
         db.delete_session(token)
-    cookie_manager = _get_cookie_manager()
-    try:
-        cookie_manager.delete(COOKIE_NAME)
-    except KeyError:
-        pass  # 쿠키가 이미 없는 경우
-    time.sleep(0.5)
+    if SESSION_QUERY_KEY in st.query_params:
+        del st.query_params[SESSION_QUERY_KEY]
+    _clear_browser_cookie()
+    time.sleep(0.3)
     st.session_state["user"] = None
     st.session_state["_session_token"] = None
     st.rerun()
@@ -78,18 +125,12 @@ def _do_login(username: str, pin: str):
         return
 
     token = db.create_session(result["username"])
-    cookie_manager = _get_cookie_manager()
-    cookie_manager.set(
-        COOKIE_NAME, token,
-        expires_at=datetime.now() + timedelta(days=db.SESSION_MAX_AGE_DAYS),
-        key="set_session_cookie",
-    )
-    # 쿠키가 브라우저에 실제로 저장되는 데 아주 잠깐 시간이 걸리는데, 그걸 기다리지 않고
-    # 바로 rerun 해버리면 저장이 중간에 끊겨서 다음 새로고침 때 쿠키가 없는 것처럼 보이는
-    # 문제가 있었습니다. 그래서 짧게 대기했다가 넘어갑니다.
-    time.sleep(0.5)
+    st.query_params[SESSION_QUERY_KEY] = token
+    _set_browser_cookie(token)
     st.session_state["user"] = result
     st.session_state["_session_token"] = token
+    # 브라우저가 쿠키 저장 스크립트를 실제로 실행할 아주 짧은 시간을 줍니다.
+    time.sleep(0.3)
     st.rerun()
 
 
@@ -140,47 +181,34 @@ def _signup_form():
             st.error(msg)
 
 
-def _try_restore_session_from_cookie():
-    """
-    쿠키에 로그인 토큰이 남아있으면 자동으로 로그인 상태를 복원.
-    반환값: "restored"(복원됨) / "loading"(쿠키 컴포넌트가 아직 로딩 중, 잠깐 기다려야 함)
-           / "none"(진짜로 로그인 정보 없음)
-    """
-    cookie_manager = _get_cookie_manager()
-    cookies = cookie_manager.get_all()
-    if cookies is None:
-        # 브라우저에 쿠키 컴포넌트가 아직 로드되는 중. 이걸 "로그인 안 됨"으로 착각하면 안 됨.
-        # 컴포넌트가 로드되면 자동으로 다시 실행되므로, 여기서는 잠깐 대기만 함.
-        return "loading"
-    token = cookies.get(COOKIE_NAME)
+def _try_restore_session_from_query():
+    """주소창 URL에 로그인 토큰(?s=...)이 있으면 자동으로 로그인 상태를 복원."""
+    token = st.query_params.get(SESSION_QUERY_KEY)
     if not token:
-        return "none"
+        return
     user = db.get_session_user(token)
     if user:
         st.session_state["user"] = user
         st.session_state["_session_token"] = token
-        return "restored"
-    return "none"
 
 
 def require_login():
     """
-    로그인 안 되어 있으면 (쿠키로도 복원 안 되면) 로그인/가입 폼만 보여주고
-    st.stop() 으로 페이지 실행을 막음.
+    로그인 안 되어 있으면 (URL 토큰으로도 복원 안 되면) 쿠키에서 자동 복구를 시도한 뒤,
+    그래도 안 되면 로그인/가입 폼을 보여주고 st.stop() 으로 페이지 실행을 막음.
     """
     _init_session()
     db.init_db()
 
     if st.session_state["user"] is None:
-        status = _try_restore_session_from_cookie()
-        if status == "loading":
-            # 쿠키를 읽어오는 아주 짧은 순간. 빈 화면 대신 안내만 보여주고,
-            # 쿠키 컴포넌트가 응답하면 스트림릿이 자동으로 다시 실행해줍니다.
-            st.caption("불러오는 중…")
-            st.stop()
+        _try_restore_session_from_query()
 
     if st.session_state["user"] is not None:
         return st.session_state["user"]
+
+    # 로그인 안 된 상태 - 혹시 브라우저 쿠키에 남아있는 토큰이 있으면, 주소를 그 토큰이
+    # 붙은 형태로 자동으로 바꿔서 새로고침을 시도합니다. (성공하면 위 코드에서 복원됨)
+    _sync_url_from_cookie()
 
     st.title("국장님 보고 진행현황")
     tab1, tab2 = st.tabs(["로그인", "최초 등록"])
