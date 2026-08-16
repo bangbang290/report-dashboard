@@ -101,17 +101,94 @@ TURSO_AUTH_TOKEN = _get_secret("TURSO_AUTH_TOKEN")
 USE_TURSO = False
 _storage_mode_decided = False
 
-_turso_client = None
+
+def _turso_base_url():
+    url = (TURSO_DATABASE_URL or "").strip()
+    # libsql:// 나 wss:// 로 되어있어도 항상 https:// 로 바꿔서 순수 웹 요청(HTTP)으로만 통신
+    for prefix in ("libsql://", "wss://", "ws://"):
+        if url.startswith(prefix):
+            url = "https://" + url[len(prefix):]
+            break
+    return url.rstrip("/")
 
 
-def _get_turso_client():
-    global _turso_client
-    if _turso_client is None:
-        import libsql_client
-        _turso_client = libsql_client.create_client_sync(
-            url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN
-        )
-    return _turso_client
+def _turso_encode_arg(value):
+    """파이썬 값을 Turso HTTP API가 요구하는 타입 있는 형태로 변환."""
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "integer", "value": str(int(value))}
+    if isinstance(value, int):
+        return {"type": "integer", "value": str(value)}
+    if isinstance(value, float):
+        return {"type": "float", "value": value}
+    return {"type": "text", "value": str(value)}
+
+
+def _turso_decode_cell(cell):
+    """Turso HTTP API가 돌려준 타입 있는 값을 평범한 파이썬 값으로 변환."""
+    if cell is None:
+        return None
+    t = cell.get("type")
+    v = cell.get("value")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(v)
+    if t == "float":
+        return float(v)
+    if t == "blob":
+        import base64
+        return base64.b64decode(v)
+    return v  # text 등은 그대로
+
+
+def _turso_pipeline(statements):
+    """
+    Turso의 /v2/pipeline HTTP API에 순수 웹 요청(requests)으로 직접 통신.
+    statements: [(sql, params_list), ...] 형태의 목록.
+    반환: 각 statement 별 결과 리스트 (딕셔너리 rows 와 lastrowid 포함).
+
+    라이브러리(libsql_client) 없이 이 방식을 쓰는 이유: 웹소켓 기반 연결이 이 배포
+    환경에서 계속 막혀서(WSServerHandshakeError), 가장 단순하고 안정적인 일반 HTTP
+    요청(POST) 방식으로 직접 통신하도록 만들었습니다.
+    """
+    import requests
+
+    url = _turso_base_url() + "/v2/pipeline"
+    reqs = []
+    for sql, params in statements:
+        stmt = {"sql": sql}
+        if params:
+            stmt["args"] = [_turso_encode_arg(p) for p in params]
+        reqs.append({"type": "execute", "stmt": stmt})
+    reqs.append({"type": "close"})
+
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={"requests": reqs},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    results = []
+    for item in data.get("results", [])[:len(statements)]:  # 마지막 close 응답 제외
+        if item.get("type") == "error":
+            err = item.get("error", {})
+            raise RuntimeError(err.get("message", str(err)) or "Turso 쿼리 오류")
+        result = item["response"]["result"]
+        cols = [c["name"] for c in result.get("cols", [])]
+        rows = [
+            dict(zip(cols, [_turso_decode_cell(cell) for cell in row]))
+            for row in result.get("rows", [])
+        ]
+        results.append({"rows": rows, "lastrowid": result.get("last_insert_rowid")})
+    return results
 
 
 def _ensure_storage_mode_decided():
@@ -130,8 +207,7 @@ def _ensure_storage_mode_decided():
         return  # 시크릿 자체가 없음 -> 로컬 모드
 
     try:
-        client = _get_turso_client()
-        client.execute("SELECT 1")
+        _turso_pipeline([("SELECT 1", [])])
         USE_TURSO = True
     except Exception as e:
         USE_TURSO = False
@@ -148,18 +224,12 @@ def _ensure_storage_mode_decided():
 
 
 class _TursoCursor:
-    """libsql_client 의 실행 결과를 sqlite3 커서처럼(.fetchone/.fetchall) 흉내내는 래퍼.
-    fetchall()이 이미 일반 dict를 반환하므로, 기존 코드의 dict(row) 호출은 dict(dict)로
-    그냥 복사만 되어 문제없이 동작합니다."""
+    """_turso_pipeline() 의 결과 하나를 sqlite3 커서처럼(.fetchone/.fetchall) 흉내내는 래퍼."""
 
-    def __init__(self, result_set):
-        columns = list(getattr(result_set, "columns", []) or [])
-        self._rows = [dict(zip(columns, row)) for row in result_set.rows]
+    def __init__(self, result):
+        self._rows = result["rows"]
         self._idx = 0
-        self.lastrowid = (
-            getattr(result_set, "last_insert_rowid", None)
-            or getattr(result_set, "last_insert_row_id", None)
-        )
+        self.lastrowid = result["lastrowid"]
 
     def fetchone(self):
         if self._idx < len(self._rows):
@@ -175,38 +245,109 @@ class _TursoCursor:
 
 
 class _TursoConn:
-    """db.py 나머지 코드가 기대하는 최소 인터페이스(.execute/.commit/.rollback/.close)로
-    libsql_client 를 감싸는 어댑터. tx가 주어지면 그 트랜잭션 범위 안에서 실행.
-    (연결의 트랜잭션 API가 없는 경우엔 tx 없이 그냥 개별 실행 - 완벽한 원자성은 아니지만
-    앱이 죽는 것보다는 낫습니다.)"""
+    """
+    db.py 나머지 코드가 기대하는 최소 인터페이스(.execute/.commit/.rollback/.close)로
+    raw HTTP pipeline 통신을 감싸는 어댑터.
 
-    def __init__(self, client, tx=None):
-        self._client = client
-        self._tx = tx
+    Turso HTTP API는 응답에 담긴 "baton" 값을 다음 요청에 실어 보내면, 같은 서버 쪽
+    연결(트랜잭션)을 계속 이어갈 수 있습니다. 이걸 이용해서, with 블록 안에서 여러 번
+    execute() 를 호출해도(예: "겹치는 시간 있는지 조회" 후 "문제없으면 저장") 전부 같은
+    트랜잭션 안에서 실제로 즉시 실행되고 결과도 바로 받아올 수 있습니다.
+    immediate=True 면 시작할 때 BEGIN IMMEDIATE 를, commit() 시 COMMIT 을 자동으로 보냅니다.
+    """
+
+    def __init__(self, immediate=False):
+        self._baton = None
+        self._immediate = immediate
+        self._closed = False
+        if immediate:
+            self._send([("BEGIN IMMEDIATE", [])])
+
+    def _send(self, statements, close=False):
+        import requests
+
+        url = _turso_base_url() + "/v2/pipeline"
+        reqs = []
+        for sql, params in statements:
+            stmt = {"sql": sql}
+            if params:
+                stmt["args"] = [_turso_encode_arg(p) for p in params]
+            reqs.append({"type": "execute", "stmt": stmt})
+        if close:
+            reqs.append({"type": "close"})
+
+        body = {"requests": reqs}
+        if self._baton:
+            body["baton"] = self._baton
+
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self._baton = data.get("baton")
+        if close:
+            self._closed = True
+
+        results = []
+        for item in data.get("results", [])[: len(statements)]:
+            if item.get("type") == "error":
+                err = item.get("error", {})
+                raise RuntimeError(err.get("message", str(err)) or "Turso 쿼리 오류")
+            result = item["response"]["result"]
+            cols = [c["name"] for c in result.get("cols", [])]
+            rows = [
+                dict(zip(cols, [_turso_decode_cell(cell) for cell in row]))
+                for row in result.get("rows", [])
+            ]
+            results.append({
+                "rows": rows,
+                "lastrowid": int(result["last_insert_rowid"]) if result.get("last_insert_rowid") else None,
+            })
+        return results
 
     def execute(self, sql, params=None):
-        target = self._tx if self._tx is not None else self._client
-        rs = target.execute(sql, params or [])
-        return _TursoCursor(rs)
+        result = self._send([(sql, params)])[0]
+        return _TursoCursor(result)
 
     def commit(self):
-        if self._tx is not None:
-            self._tx.commit()
+        if self._closed:
+            return
+        if self._immediate:
+            self._send([("COMMIT", [])], close=True)
+        else:
+            self._send([], close=True)
 
     def rollback(self):
-        if self._tx is not None:
-            self._tx.rollback()
+        if self._closed:
+            return
+        try:
+            if self._immediate:
+                self._send([("ROLLBACK", [])], close=True)
+            else:
+                self._send([], close=True)
+        except Exception:
+            self._closed = True
 
     def close(self):
-        pass  # 클라이언트는 프로세스 전체에서 재사용, 개별 연결 단위로 닫지 않음
+        if not self._closed:
+            try:
+                self._send([], close=True)
+            except Exception:
+                self._closed = True
 
 
 @contextmanager
 def get_conn():
     _ensure_storage_mode_decided()
     if USE_TURSO:
-        client = _get_turso_client()
-        conn = _TursoConn(client)
+        conn = _TursoConn(immediate=False)
         try:
             yield conn
             conn.commit()
@@ -231,15 +372,12 @@ def get_conn_immediate():
     """
     쓰기 작업 하나를 '한 명씩 순서대로'만 처리하도록 즉시 쓰기 락을 거는 트랜잭션.
     같은 시간대 중복 등록 같은 동시 접속 문제를 막기 위해 사용.
+    Turso 모드에서는 baton 으로 서버 쪽 트랜잭션(BEGIN IMMEDIATE ~ COMMIT)을 그대로 이어가므로,
+    로컬 SQLite 모드와 동일한 수준의 원자성을 유지합니다.
     """
     _ensure_storage_mode_decided()
     if USE_TURSO:
-        client = _get_turso_client()
-        try:
-            tx = client.transaction()
-        except Exception:
-            tx = None  # 이 연결 방식이 트랜잭션을 지원 안 하면, tx 없이 개별 실행으로 대체
-        conn = _TursoConn(client, tx=tx)
+        conn = _TursoConn(immediate=True)
         try:
             yield conn
             conn.commit()
