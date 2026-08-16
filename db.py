@@ -139,7 +139,9 @@ def _ensure_storage_mode_decided():
             import streamlit as st
             st.warning(
                 f"⚠️ Turso(영구 저장소) 연결에 실패해서, 이번 실행은 로컬 저장 방식으로 동작합니다. "
-                f"(오류: {type(e).__name__}) 이 경우 앱이 재배포되거나 오래 쉬면 데이터가 초기화될 수 있습니다."
+                f"이 경우 앱이 재배포되거나 오래 쉬면 데이터가 초기화될 수 있습니다.\n\n"
+                f"**오류 종류**: `{type(e).__name__}`\n\n"
+                f"**상세 내용**: `{str(e)}`"
             )
         except Exception:
             pass
