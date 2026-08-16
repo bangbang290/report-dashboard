@@ -143,54 +143,6 @@ def _turso_decode_cell(cell):
     return v  # text 등은 그대로
 
 
-def _turso_pipeline(statements):
-    """
-    Turso의 /v2/pipeline HTTP API에 순수 웹 요청(requests)으로 직접 통신.
-    statements: [(sql, params_list), ...] 형태의 목록.
-    반환: 각 statement 별 결과 리스트 (딕셔너리 rows 와 lastrowid 포함).
-
-    라이브러리(libsql_client) 없이 이 방식을 쓰는 이유: 웹소켓 기반 연결이 이 배포
-    환경에서 계속 막혀서(WSServerHandshakeError), 가장 단순하고 안정적인 일반 HTTP
-    요청(POST) 방식으로 직접 통신하도록 만들었습니다.
-    """
-    import requests
-
-    url = _turso_base_url() + "/v2/pipeline"
-    reqs = []
-    for sql, params in statements:
-        stmt = {"sql": sql}
-        if params:
-            stmt["args"] = [_turso_encode_arg(p) for p in params]
-        reqs.append({"type": "execute", "stmt": stmt})
-    reqs.append({"type": "close"})
-
-    resp = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={"requests": reqs},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    results = []
-    for item in data.get("results", [])[:len(statements)]:  # 마지막 close 응답 제외
-        if item.get("type") == "error":
-            err = item.get("error", {})
-            raise RuntimeError(err.get("message", str(err)) or "Turso 쿼리 오류")
-        result = item["response"]["result"]
-        cols = [c["name"] for c in result.get("cols", [])]
-        rows = [
-            dict(zip(cols, [_turso_decode_cell(cell) for cell in row]))
-            for row in result.get("rows", [])
-        ]
-        results.append({"rows": rows, "lastrowid": result.get("last_insert_rowid")})
-    return results
-
-
 def _ensure_storage_mode_decided():
     """
     앱이 시작될 때 딱 한 번, Turso 시크릿이 있으면 실제로 접속을 테스트해봅니다.
@@ -207,7 +159,9 @@ def _ensure_storage_mode_decided():
         return  # 시크릿 자체가 없음 -> 로컬 모드
 
     try:
-        _turso_pipeline([("SELECT 1", [])])
+        conn = _TursoConn(immediate=False)
+        conn.execute("SELECT 1")
+        conn.commit()
         USE_TURSO = True
     except Exception as e:
         USE_TURSO = False
@@ -224,7 +178,7 @@ def _ensure_storage_mode_decided():
 
 
 class _TursoCursor:
-    """_turso_pipeline() 의 결과 하나를 sqlite3 커서처럼(.fetchone/.fetchall) 흉내내는 래퍼."""
+    """_TursoConn._send() 의 결과 하나를 sqlite3 커서처럼(.fetchone/.fetchall) 흉내내는 래퍼."""
 
     def __init__(self, result):
         self._rows = result["rows"]
@@ -289,7 +243,9 @@ class _TursoConn:
             json=body,
             timeout=15,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            # 서버가 보내주는 에러 상세 내용(response body)까지 그대로 예외 메시지에 포함시킴
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
         data = resp.json()
         self._baton = data.get("baton")
         if close:
