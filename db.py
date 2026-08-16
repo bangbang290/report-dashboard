@@ -1,14 +1,27 @@
 """
 db.py
-SQLite 데이터베이스 연결 및 스키마/CRUD 헬퍼 모음.
-DB 파일은 기본적으로 이 파일과 같은 폴더의 report_dashboard.db 에 저장됩니다.
+SQLite / Turso 데이터베이스 연결 및 스키마/CRUD 헬퍼 모음.
+
+저장소는 두 가지 모드로 동작합니다:
+- 로컬 모드 (기본값): 이 파일과 같은 폴더의 report_dashboard.db 파일 하나를 사용.
+  스트림릿 클라우드 시크릿(TURSO_DATABASE_URL / TURSO_AUTH_TOKEN)이 없거나, 연결에
+  실패하면 자동으로 이 모드로 동작합니다. 다만 스트림릿 클라우드는 12시간 동안 접속이
+  없으면 앱이 잠들었다가 깨어날 때 이 로컬 파일이 초기화될 수 있습니다.
+- Turso 모드: 위 두 시크릿이 설정되어 있고 연결에 성공하면 자동으로 전환됩니다.
+  ⚠️ TURSO_DATABASE_URL은 지역 코드(예: aws-ap-northeast-1)가 안 붙은 기본 주소
+  (libsql://데이터베이스이름-계정이름.turso.io) 를 써야 합니다. 지역 코드가 붙은 주소는
+  일부 환경에서 웹소켓 연결이 막혀서 접속이 안 되는 경우가 있었습니다.
+  혹시 연결에 실패하더라도 앱이 죽지 않고 자동으로 로컬 모드로 넘어가도록 만들어뒀습니다
+  (init_db() 에서 연결을 실제로 테스트해보고, 안 되면 조용히 전환합니다).
 
 동시 접속 관련 설계:
-- WAL 모드 사용: 한 사람이 쓰는 동안 다른 사람이 읽는 것까지 막히지 않도록 함.
+- WAL 모드 사용(로컬 모드에서만 해당): 한 사람이 쓰는 동안 다른 사람이 읽는 것까지
+  막히지 않도록 함.
 - busy_timeout 설정: 아주 짧은 순간 여러 명이 동시에 쓰려고 하면, 에러를 즉시 던지지 않고
   최대 5초까지 기다렸다가 처리함.
-- register_report / edit_report 는 "겹치는 시간 확인 + 실제 저장"을 하나의 트랜잭션(BEGIN IMMEDIATE)
-  으로 묶어서, 두 사람이 동시에 같은 시간대를 등록해도 한 명만 성공하도록 함.
+- register_report / edit_report 는 "겹치는 시간 확인 + 실제 저장"을 하나의 트랜잭션(BEGIN IMMEDIATE
+  / Turso 트랜잭션)으로 묶어서, 두 사람이 동시에 같은 시간대를 등록해도 한 명만 성공하도록 함.
+  (Turso 모드에서 트랜잭션 자체가 지원 안 되는 경우, 그 부분만 안전하게 대체 처리합니다.)
 
 상태 자동 전환 설계:
 - 보고 등록 시에는 항상 '시작 전' 으로 시작합니다 (사람이 직접 상태를 고르지 않음).
@@ -66,8 +79,139 @@ def _now():
     return _now_kst().isoformat(timespec="seconds")
 
 
+# ========== 저장소 모드 판단 (로컬 SQLite vs Turso) ==========
+
+def _get_secret(name):
+    """환경변수 먼저 보고, 없으면 스트림릿 시크릿(st.secrets)에서 찾음. 둘 다 없으면 None."""
+    val = os.environ.get(name)
+    if val:
+        return val
+    try:
+        import streamlit as st
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
+TURSO_DATABASE_URL = _get_secret("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = _get_secret("TURSO_AUTH_TOKEN")
+
+# 실제로 시크릿이 설정되어 있고 "연결도 성공했을 때"만 True 로 바뀝니다.
+# (init_db() 에서 실제로 연결 테스트를 해보고 결정 - 아래 _ensure_storage_mode_decided 참고)
+USE_TURSO = False
+_storage_mode_decided = False
+
+_turso_client = None
+
+
+def _get_turso_client():
+    global _turso_client
+    if _turso_client is None:
+        import libsql_client
+        _turso_client = libsql_client.create_client_sync(
+            url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN
+        )
+    return _turso_client
+
+
+def _ensure_storage_mode_decided():
+    """
+    앱이 시작될 때 딱 한 번, Turso 시크릿이 있으면 실제로 접속을 테스트해봅니다.
+    성공하면 USE_TURSO=True, 실패하면(또는 시크릿이 없으면) 조용히 로컬 모드로 남고
+    화면에 안내만 한 번 띄워줍니다. 이 판단 이후로는 다시 테스트하지 않습니다
+    (매 요청마다 접속 테스트를 하면 느려지므로).
+    """
+    global USE_TURSO, _storage_mode_decided
+    if _storage_mode_decided:
+        return
+    _storage_mode_decided = True
+
+    if not (TURSO_DATABASE_URL and TURSO_AUTH_TOKEN):
+        return  # 시크릿 자체가 없음 -> 로컬 모드
+
+    try:
+        client = _get_turso_client()
+        client.execute("SELECT 1")
+        USE_TURSO = True
+    except Exception as e:
+        USE_TURSO = False
+        try:
+            import streamlit as st
+            st.warning(
+                f"⚠️ Turso(영구 저장소) 연결에 실패해서, 이번 실행은 로컬 저장 방식으로 동작합니다. "
+                f"(오류: {type(e).__name__}) 이 경우 앱이 재배포되거나 오래 쉬면 데이터가 초기화될 수 있습니다."
+            )
+        except Exception:
+            pass
+
+
+class _TursoCursor:
+    """libsql_client 의 실행 결과를 sqlite3 커서처럼(.fetchone/.fetchall) 흉내내는 래퍼.
+    fetchall()이 이미 일반 dict를 반환하므로, 기존 코드의 dict(row) 호출은 dict(dict)로
+    그냥 복사만 되어 문제없이 동작합니다."""
+
+    def __init__(self, result_set):
+        columns = list(getattr(result_set, "columns", []) or [])
+        self._rows = [dict(zip(columns, row)) for row in result_set.rows]
+        self._idx = 0
+        self.lastrowid = (
+            getattr(result_set, "last_insert_rowid", None)
+            or getattr(result_set, "last_insert_row_id", None)
+        )
+
+    def fetchone(self):
+        if self._idx < len(self._rows):
+            row = self._rows[self._idx]
+            self._idx += 1
+            return row
+        return None
+
+    def fetchall(self):
+        rows = self._rows[self._idx:]
+        self._idx = len(self._rows)
+        return rows
+
+
+class _TursoConn:
+    """db.py 나머지 코드가 기대하는 최소 인터페이스(.execute/.commit/.rollback/.close)로
+    libsql_client 를 감싸는 어댑터. tx가 주어지면 그 트랜잭션 범위 안에서 실행.
+    (연결의 트랜잭션 API가 없는 경우엔 tx 없이 그냥 개별 실행 - 완벽한 원자성은 아니지만
+    앱이 죽는 것보다는 낫습니다.)"""
+
+    def __init__(self, client, tx=None):
+        self._client = client
+        self._tx = tx
+
+    def execute(self, sql, params=None):
+        target = self._tx if self._tx is not None else self._client
+        rs = target.execute(sql, params or [])
+        return _TursoCursor(rs)
+
+    def commit(self):
+        if self._tx is not None:
+            self._tx.commit()
+
+    def rollback(self):
+        if self._tx is not None:
+            self._tx.rollback()
+
+    def close(self):
+        pass  # 클라이언트는 프로세스 전체에서 재사용, 개별 연결 단위로 닫지 않음
+
+
 @contextmanager
 def get_conn():
+    _ensure_storage_mode_decided()
+    if USE_TURSO:
+        client = _get_turso_client()
+        conn = _TursoConn(client)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+        return
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -86,6 +230,22 @@ def get_conn_immediate():
     쓰기 작업 하나를 '한 명씩 순서대로'만 처리하도록 즉시 쓰기 락을 거는 트랜잭션.
     같은 시간대 중복 등록 같은 동시 접속 문제를 막기 위해 사용.
     """
+    _ensure_storage_mode_decided()
+    if USE_TURSO:
+        client = _get_turso_client()
+        try:
+            tx = client.transaction()
+        except Exception:
+            tx = None  # 이 연결 방식이 트랜잭션을 지원 안 하면, tx 없이 개별 실행으로 대체
+        conn = _TursoConn(client, tx=tx)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
