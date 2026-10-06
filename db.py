@@ -494,6 +494,14 @@ def create_user(username: str, password: str, department: str = "", role: str = 
         return True, "계정이 생성되었습니다."
     except sqlite3.IntegrityError:
         return False, "이미 존재하는 이름입니다. 다른 이름을 사용하거나 로그인해주세요."
+    except RuntimeError as e:
+        # Turso(HTTP) 경로에서는 UNIQUE 제약 위반이 sqlite3.IntegrityError가 아니라
+        # 이 RuntimeError로 올라옵니다. 메시지에 UNIQUE 관련 문구가 있으면 중복 이름
+        # 오류로 간주해서 로컬 저장 방식과 동일하게 안내합니다. 그 외의 오류는 그대로
+        # 다시 발생시켜서 숨기지 않습니다.
+        if "UNIQUE" in str(e).upper():
+            return False, "이미 존재하는 이름입니다. 다른 이름을 사용하거나 로그인해주세요."
+        raise
 
 
 def _is_locked_out(conn, username: str):
