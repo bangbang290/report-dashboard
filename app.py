@@ -20,7 +20,7 @@ auth.require_login()
 auth.sidebar_user_info()
 
 st.title("📢 국장님 보고 실시간 현황")
-st.caption("시작 전 · 진행 중 상태인 보고만 예정 시각 순서로 보여줍니다. 전체 이력이나 등록/수정은 왼쪽 '보고 진행현황' 페이지를 이용해주세요.")
+st.caption("오늘 예정된 보고 중 시작 전 · 진행 중 상태인 건만 예정 시각 순서로 보여줍니다. 전체 이력이나 등록/수정은 왼쪽 '보고 진행현황' 페이지를 이용해주세요.")
 
 with st.sidebar:
     st.divider()
@@ -34,13 +34,15 @@ if auto_refresh:
 
 db.auto_update_statuses()  # 예정 시각 지난 건 진행중/완료로 자동 전환
 
+today_str = db._now_kst().date().isoformat()
+
 active_reports = [
     r for r in db.list_reports(order_by="scheduled_date")
-    if r["status"] in ("시작 전", "진행 중")
+    if r["status"] in ("시작 전", "진행 중") and r["scheduled_date"] == today_str
 ]
 
 if not active_reports:
-    st.info("현재 대기 중이거나 진행 중인 보고가 없습니다.")
+    st.info("오늘 예정된 보고 중 대기 중이거나 진행 중인 건이 없습니다.")
 else:
     col_status_order = {"진행 중": 0, "시작 전": 1}
     active_reports.sort(key=lambda r: (col_status_order.get(r["status"], 2), r["scheduled_date"] or "9999"))
