@@ -36,10 +36,7 @@ db.auto_update_statuses()  # 예정 시각 지난 건 진행중/완료로 자동
 
 today_str = db._now_kst().date().isoformat()
 
-active_reports = [
-    r for r in db.list_reports(order_by="scheduled_date")
-    if r["status"] in ("시작 전", "진행 중") and r["scheduled_date"] == today_str
-]
+active_reports = db.list_active_reports_for_date(today_str)
 
 if not active_reports:
     st.info("오늘 예정된 보고 중 대기 중이거나 진행 중인 건이 없습니다.")

@@ -38,6 +38,8 @@ import sqlite3
 import hashlib
 import os
 import secrets
+import threading
+from queue import LifoQueue, Empty, Full
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from contextlib import contextmanager
@@ -101,6 +103,40 @@ TURSO_AUTH_TOKEN = _get_secret("TURSO_AUTH_TOKEN")
 USE_TURSO = False
 _storage_mode_decided = False
 
+# Streamlit 재실행/동시 접속에서도 스키마 준비는 프로세스당 한 번만 수행합니다.
+# 저장소 접속 판단과 스키마 준비가 서로 호출되므로 재진입 가능한 락을 사용합니다.
+_init_lock = threading.RLock()
+_initialized_database_key = None
+
+# HTTP 연결만 재사용합니다. DB 트랜잭션/baton/로그인 정보는 공유하지 않습니다.
+# 큐에서 꺼낸 Session은 한 요청만 독점 사용하므로 동시 접속 시에도 섞이지 않습니다.
+_http_sessions = LifoQueue(maxsize=8)
+
+
+@contextmanager
+def _http_session():
+    import requests
+
+    try:
+        session = _http_sessions.get_nowait()
+    except Empty:
+        session = requests.Session()
+        # 저장 요청을 자동 재시도하면 중복 등록될 수 있어 재시도는 끕니다.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4, pool_maxsize=4, max_retries=0,
+        )
+        session.mount("https://", adapter)
+    try:
+        yield session
+    except BaseException:
+        session.close()
+        raise
+    else:
+        try:
+            _http_sessions.put_nowait(session)
+        except Full:
+            session.close()
+
 
 def _turso_base_url():
     url = (TURSO_DATABASE_URL or "").strip()
@@ -151,30 +187,33 @@ def _ensure_storage_mode_decided():
     (매 요청마다 접속 테스트를 하면 느려지므로).
     """
     global USE_TURSO, _storage_mode_decided
-    if _storage_mode_decided:
-        return
-    _storage_mode_decided = True
+    with _init_lock:
+        if _storage_mode_decided:
+            return
 
-    if not (TURSO_DATABASE_URL and TURSO_AUTH_TOKEN):
-        return  # 시크릿 자체가 없음 -> 로컬 모드
+        if not (TURSO_DATABASE_URL and TURSO_AUTH_TOKEN):
+            _storage_mode_decided = True
+            return  # 시크릿 자체가 없음 -> 로컬 모드
 
-    try:
-        conn = _TursoConn(immediate=False)
-        conn.execute("SELECT 1")
-        conn.commit()
-        USE_TURSO = True
-    except Exception as e:
-        USE_TURSO = False
         try:
-            import streamlit as st
-            st.warning(
-                f"⚠️ Turso(영구 저장소) 연결에 실패해서, 이번 실행은 로컬 저장 방식으로 동작합니다. "
-                f"이 경우 앱이 재배포되거나 오래 쉬면 데이터가 초기화될 수 있습니다.\n\n"
-                f"**오류 종류**: `{type(e).__name__}`\n\n"
-                f"**상세 내용**: `{str(e)}`"
-            )
-        except Exception:
-            pass
+            conn = _TursoConn(immediate=False)
+            conn.execute("SELECT 1")
+            conn.commit()
+            USE_TURSO = True
+        except Exception as e:
+            USE_TURSO = False
+            try:
+                import streamlit as st
+                st.warning(
+                    f"⚠️ Turso(영구 저장소) 연결에 실패해서, 이번 실행은 로컬 저장 방식으로 동작합니다. "
+                    f"이 경우 앱이 재배포되거나 오래 쉬면 데이터가 초기화될 수 있습니다.\n\n"
+                    f"**오류 종류**: `{type(e).__name__}`\n\n"
+                    f"**상세 내용**: `{str(e)}`"
+                )
+            except Exception:
+                pass
+
+        _storage_mode_decided = True
 
 
 class _TursoCursor:
@@ -218,8 +257,6 @@ class _TursoConn:
             self._send([("BEGIN IMMEDIATE", [])])
 
     def _send(self, statements, close=False):
-        import requests
-
         url = _turso_base_url() + "/v2/pipeline"
         reqs = []
         for sql, params in statements:
@@ -234,15 +271,16 @@ class _TursoConn:
         if self._baton:
             body["baton"] = self._baton
 
-        resp = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=15,
-        )
+        with _http_session() as session:
+            resp = session.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=15,
+            )
         if not resp.ok:
             # 서버가 보내주는 에러 상세 내용(response body)까지 그대로 예외 메시지에 포함시킴
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
@@ -268,8 +306,13 @@ class _TursoConn:
             })
         return results
 
-    def execute(self, sql, params=None):
-        result = self._send([(sql, params)])[0]
+    def execute(self, sql, params=None, *, close=False):
+        if self._closed:
+            raise RuntimeError("이미 닫힌 DB 연결입니다.")
+        if close and self._immediate:
+            # BEGIN IMMEDIATE 이후에는 반드시 기존 commit/rollback 경로를 사용합니다.
+            raise RuntimeError("트랜잭션 안에서는 조회와 연결 종료를 묶을 수 없습니다.")
+        result = self._send([(sql, params)], close=close)[0]
         return _TursoCursor(result)
 
     def commit(self):
@@ -362,7 +405,29 @@ def _table_columns(conn, table_name):
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
 
 
-def init_db():
+def init_db(force=False):
+    """동일 저장소의 스키마를 한 번만 준비. 실패하면 다음 호출에서 재시도합니다.
+
+    서버 재시작/모듈 재로드 시 다시 확인합니다. 운영 중 강제 확인이 필요한 경우에만
+    init_db(force=True)를 사용합니다. 보고/일정/계정 데이터는 캐시하지 않습니다.
+    """
+    global _initialized_database_key
+    with _init_lock:
+        _ensure_storage_mode_decided()
+        database_key = (
+            ("turso", _turso_base_url()) if USE_TURSO
+            else ("sqlite", os.path.abspath(DB_PATH))
+        )
+        local_file_exists = USE_TURSO or os.path.isfile(DB_PATH)
+        if not force and _initialized_database_key == database_key and local_file_exists:
+            return
+        # 강제 재초기화가 실패해도, 이전 성공 표시로 다음 시도가 생략되지 않게 합니다.
+        _initialized_database_key = None
+        _create_schema()
+        _initialized_database_key = database_key
+
+
+def _create_schema():
     """최초 실행 시 테이블이 없으면 생성. 이미 있으면 부족한 컬럼만 추가(스키마 업그레이드)."""
     with get_conn() as conn:
         conn.execute(
@@ -445,6 +510,25 @@ def init_db():
         )
 
 
+def _read_rows(sql, params=()):
+    """독립적인 조회 한 번. Turso는 execute와 close를 한 HTTP 요청으로 묶습니다.
+
+    결과는 매 호출 새로 읽으며 사용자 간/화면 재실행 간 데이터 캐시는 하지 않습니다.
+    여러 SQL이 한 연결을 사용해야 하는 작업은 기존 get_conn 경로를 그대로 사용합니다.
+    """
+    with get_conn() as conn:
+        if isinstance(conn, _TursoConn):
+            rows = conn.execute(sql, params, close=True).fetchall()
+        else:
+            rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _read_row(sql, params=()):
+    rows = _read_rows(sql, params)
+    return rows[0] if rows else None
+
+
 # ---------- 활동 이력 (감사로그) ----------
 
 def log_activity(table_name: str, record_id, action: str, actor: str, detail: str = "", conn=None):
@@ -463,11 +547,7 @@ def log_activity(table_name: str, record_id, action: str, actor: str, detail: st
 
 
 def list_activity(limit: int = 200):
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM activity_log ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-    return [dict(r) for r in rows]
+    return _read_rows("SELECT * FROM activity_log ORDER BY id DESC LIMIT ?", (limit,))
 
 
 # ---------- 비밀번호 해시 ----------
@@ -548,33 +628,23 @@ def verify_user(username: str, password: str):
 
 
 def user_exists(username: str) -> bool:
-    with get_conn() as conn:
-        row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username.strip(),)).fetchone()
-    return row is not None
+    return _read_row("SELECT 1 FROM users WHERE username = ?", (username.strip(),)) is not None
 
 
 def any_admin_exists() -> bool:
-    with get_conn() as conn:
-        row = conn.execute("SELECT 1 FROM users WHERE role = ?", (ROLE_ADMIN,)).fetchone()
-    return row is not None
+    return _read_row("SELECT 1 FROM users WHERE role = ?", (ROLE_ADMIN,)) is not None
 
 
 def list_users():
-    with get_conn() as conn:
-        rows = conn.execute("SELECT id, username, department, role, created_at FROM users ORDER BY username").fetchall()
-    return [dict(r) for r in rows]
+    return _read_rows("SELECT id, username, department, role, created_at FROM users ORDER BY username")
 
 
 def get_user_by_id(user_id: int):
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    return dict(row) if row else None
+    return _read_row("SELECT * FROM users WHERE id = ?", (user_id,))
 
 
 def count_admins() -> int:
-    with get_conn() as conn:
-        row = conn.execute("SELECT COUNT(*) AS c FROM users WHERE role = ?", (ROLE_ADMIN,)).fetchone()
-    return row["c"]
+    return _read_row("SELECT COUNT(*) AS c FROM users WHERE role = ?", (ROLE_ADMIN,))["c"]
 
 
 def set_user_role(user_id: int, new_role: str, actor: str):
@@ -684,9 +754,7 @@ def get_times_for_date(date_str: str, exclude_id: int = None, conn=None):
     if conn is not None:
         rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
-    with get_conn() as c:
-        rows = c.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+    return _read_rows(query, params)
 
 
 def _compute_status_for_schedule(scheduled_date, scheduled_time, now=None):
@@ -806,15 +874,21 @@ def list_reports(status_filter=None, order_by="scheduled_date"):
         query += " WHERE status = ?"
         params = (status_filter,)
     query += f" ORDER BY {order_by} IS NULL, {order_by} ASC, scheduled_time ASC"
-    with get_conn() as conn:
-        rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+    return _read_rows(query, params)
+
+
+def list_active_reports_for_date(date_str):
+    """실시간 화면용: 오늘의 시작 전/진행 중 보고만 최신 DB에서 읽습니다."""
+    return _read_rows(
+        "SELECT * FROM reports WHERE scheduled_date = ? "
+        "AND status IN ('시작 전', '진행 중') "
+        "ORDER BY scheduled_date IS NULL, scheduled_date ASC, scheduled_time ASC",
+        (date_str,),
+    )
 
 
 def get_report(report_id):
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-    return dict(row) if row else None
+    return _read_row("SELECT * FROM reports WHERE id = ?", (report_id,))
 
 
 def auto_update_statuses():
@@ -898,12 +972,8 @@ def list_schedule(month=None):
         query += " WHERE event_date LIKE ?"
         params = (f"{month}%",)
     query += " ORDER BY event_date ASC"
-    with get_conn() as conn:
-        rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+    return _read_rows(query, params)
 
 
 def get_schedule_item(schedule_id):
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM monthly_schedule WHERE id = ?", (schedule_id,)).fetchone()
-    return dict(row) if row else None
+    return _read_row("SELECT * FROM monthly_schedule WHERE id = ?", (schedule_id,))

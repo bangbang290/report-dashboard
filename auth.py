@@ -148,7 +148,8 @@ def _signup_form():
     st.subheader("📝 최초 등록")
     st.caption("처음 접속하는 분은 여기서 이름과 PIN(숫자 4자리)을 등록해주세요. 이후에는 로그인 탭을 이용하시면 됩니다.")
 
-    if not db.any_admin_exists():
+    admin_exists = db.any_admin_exists()
+    if not admin_exists:
         st.warning("⚠️ 아직 관리자 계정이 없습니다. 지금 가입하는 분이 반드시 '관리자로 등록'을 체크해주세요.")
 
     with st.form("signup_form"):
@@ -157,7 +158,7 @@ def _signup_form():
         pin = st.text_input("PIN (숫자 4자리)", type="password", max_chars=4, key="signup_pin")
         pin2 = st.text_input("PIN 확인", type="password", max_chars=4, key="signup_pin2")
         make_admin = False
-        if not db.any_admin_exists():
+        if not admin_exists:
             make_admin = st.checkbox("이 계정을 관리자 계정으로 등록 (최초 1회만 표시됩니다)", key="signup_make_admin")
         submitted = st.form_submit_button("등록하기", use_container_width=True)
 
